@@ -10,6 +10,23 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: meterdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/main/resources/schema-postgres.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   index-service:
     build: .
     ports:
@@ -17,9 +34,16 @@ services:
     environment:
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/meterdb
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
       INDEX_CACHE_MAX_SIZE: 100000
+      INDEX_PERSISTENCE_ENABLED: "true"
+      INDEX_PERSISTENCE_ASYNC_WRITE: "true"
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   benchmark:
@@ -34,3 +58,6 @@ services:
         condition: service_healthy
       index-service:
         condition: service_started
+
+volumes:
+  postgres_data:

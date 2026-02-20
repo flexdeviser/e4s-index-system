@@ -11,6 +11,11 @@ import org.springframework.context.annotation.Configuration;
  * index:
  *   cache:
  *     max-size: 100000
+ *   persistence:
+ *     enabled: true
+ *     schema: e4s_index
+ *     batch-size: 1000
+ *     async-write: true
  * </pre>
  * 
  * @author E4S Team
@@ -21,6 +26,7 @@ import org.springframework.context.annotation.Configuration;
 public class IndexProperties {
 
     private Cache cache = new Cache();
+    private Persistence persistence = new Persistence();
 
     /**
      * Gets the cache configuration.
@@ -38,6 +44,24 @@ public class IndexProperties {
      */
     public void setCache(Cache cache) {
         this.cache = cache;
+    }
+
+    /**
+     * Gets the persistence configuration.
+     *
+     * @return the persistence configuration
+     */
+    public Persistence getPersistence() {
+        return persistence;
+    }
+
+    /**
+     * Sets the persistence configuration.
+     *
+     * @param persistence the persistence configuration
+     */
+    public void setPersistence(Persistence persistence) {
+        this.persistence = persistence;
     }
 
     /**
@@ -62,6 +86,107 @@ public class IndexProperties {
          */
         public void setMaxSize(int maxSize) {
             this.maxSize = maxSize;
+        }
+    }
+
+    /**
+     * Persistence configuration properties for PostgreSQL.
+     */
+    public static class Persistence {
+        private boolean enabled = false;
+        private String schema = "e4s_index";
+        private int batchSize = 1000;
+        private boolean asyncWrite = true;
+        private long flushIntervalMs = 100;
+
+        /**
+         * Gets whether persistence is enabled.
+         *
+         * @return true if enabled
+         */
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        /**
+         * Sets whether persistence is enabled.
+         *
+         * @param enabled true to enable
+         */
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        /**
+         * Gets the PostgreSQL schema name.
+         *
+         * @return the schema name
+         */
+        public String getSchema() {
+            return schema;
+        }
+
+        /**
+         * Sets the PostgreSQL schema name.
+         *
+         * @param schema the schema name
+         */
+        public void setSchema(String schema) {
+            this.schema = schema;
+        }
+
+        /**
+         * Gets the batch size for bulk operations.
+         *
+         * @return the batch size
+         */
+        public int getBatchSize() {
+            return batchSize;
+        }
+
+        /**
+         * Sets the batch size for bulk operations.
+         *
+         * @param batchSize the batch size
+         */
+        public void setBatchSize(int batchSize) {
+            this.batchSize = batchSize;
+        }
+
+        /**
+         * Gets whether writes to PostgreSQL should be async.
+         *
+         * @return true if async
+         */
+        public boolean isAsyncWrite() {
+            return asyncWrite;
+        }
+
+        /**
+         * Sets whether writes to PostgreSQL should be async.
+         *
+         * @param asyncWrite true for async
+         */
+        public void setAsyncWrite(boolean asyncWrite) {
+            this.asyncWrite = asyncWrite;
+        }
+
+        /**
+         * Gets the flush interval for Redis write-behind.
+         *
+         * @return flush interval in milliseconds
+         */
+        public long getFlushIntervalMs() {
+            return flushIntervalMs;
+        }
+
+        /**
+         * Sets the flush interval for Redis write-behind.
+         *
+         * @param flushIntervalMs flush interval in milliseconds
+         */
+        public void setFlushIntervalMs(long flushIntervalMs) {
+            this.flushIntervalMs = flushIntervalMs;
         }
     }
 }

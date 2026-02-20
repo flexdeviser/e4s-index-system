@@ -130,7 +130,17 @@ public class IndexServiceImpl implements IndexService {
     @Override
     public boolean indexExists(String indexName) {
         checkClosed();
-        return Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(INDEX_SET_KEY, indexName.getBytes()));
+        boolean existsInRedis = Boolean.TRUE.equals(
+                redisTemplate.opsForSet().isMember(INDEX_SET_KEY, indexName.getBytes()));
+        if (existsInRedis) {
+            return true;
+        }
+        
+        if (persistenceEnabled && pgRepository != null) {
+            return pgRepository.countByIndexName(indexName) > 0;
+        }
+        
+        return false;
     }
 
     @Override
@@ -522,6 +532,7 @@ public class IndexServiceImpl implements IndexService {
             
             byte[] bitmapData = pgRepository.getPartitionBitmap(indexName, entityId, granularity, partition);
             if (bitmapData != null && bitmapData.length > 0) {
+                redisTemplate.opsForSet().add(INDEX_SET_KEY, indexName.getBytes());
                 return TimeIndex.deserialize(bitmapData);
             }
         } catch (Exception e) {

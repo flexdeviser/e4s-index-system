@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS meter_day_index (
+    meter_id BIGINT PRIMARY KEY,
+    day_bitmap BYTEA NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

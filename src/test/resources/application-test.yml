@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: e4s-index-system-test
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+index:
+  cache:
+    max-size: 100
+
+logging:
+  level:
+    com.e4s.index: DEBUG

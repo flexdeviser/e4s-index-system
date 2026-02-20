@@ -1,0 +1,10 @@
+FROM eclipse-temurin:17-jre-alpine
+
+WORKDIR /app
+
+RUN apk add --no-cache curl
+
+COPY target/e4s-index-system-1.0.0-SNAPSHOT.jar ./app.jar
+COPY target/test-classes ./test-classes
+
+ENTRYPOINT ["java", "-cp", "app.jar:test-classes", "com.e4s.index.benchmark.RedisBenchmark"]

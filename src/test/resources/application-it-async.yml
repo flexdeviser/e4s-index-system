@@ -1,0 +1,31 @@
+spring:
+  application:
+    name: e4s-index-system-it-async
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/meterdb
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 5
+
+index:
+  cache:
+    max-size: 1000
+  persistence:
+    enabled: true
+    schema: e4s_index
+    batch-size: 100
+    async-write: true
+    flush-interval-ms: 0
+
+logging:
+  level:
+    com.e4s.index: DEBUG
+    org.springframework.jdbc: DEBUG

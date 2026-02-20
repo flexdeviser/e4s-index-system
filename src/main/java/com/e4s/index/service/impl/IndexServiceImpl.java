@@ -175,7 +175,7 @@ public class IndexServiceImpl implements IndexService {
             markDirty(key, index);
             
             if (persistenceEnabled) {
-                saveToPostgres(indexName, entityId, granularity, value, partition);
+                saveToPostgres(indexName, entityId, granularity, value, partition, index);
             }
         } finally {
             lock.writeLock().unlock();
@@ -183,26 +183,65 @@ public class IndexServiceImpl implements IndexService {
     }
     
     private void saveToPostgres(String indexName, Long entityId, Granularity granularity, 
-                                int value, int partition) {
-        MeterIndex pgIndex = new MeterIndex(indexName, entityId, granularity, value, partition);
+                                int value, int partition, TimeIndex index) {
+        savePartitionBitmapToPostgres(indexName, entityId, granularity, partition, index);
+    }
+
+    private void savePartitionBitmapToPostgres(String indexName, Long entityId, Granularity granularity, 
+                                               int partition, TimeIndex index) {
         if (asyncPgWrite) {
             java.util.concurrent.CompletableFuture.runAsync(() -> {
                 try {
-                    pgRepository.save(pgIndex);
+                    savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
                 } catch (Exception e) {
-                    // Log but don't fail the main operation
                     org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
-                            .error("Failed to save to PostgreSQL: {}", e.getMessage());
+                            .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
                 }
             });
         } else {
             try {
-                pgRepository.save(pgIndex);
+                savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
             } catch (Exception e) {
                 org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
-                        .error("Failed to save to PostgreSQL: {}", e.getMessage());
+                        .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
             }
         }
+    }
+
+    private void savePartitionBitmapToPgSync(String indexName, Long entityId, Granularity granularity, 
+                                               int partition, TimeIndex index) {
+        try {
+            byte[] existingBitmap = pgRepository.getPartitionBitmap(indexName, entityId, granularity, partition);
+            
+            TimeIndex mergedIndex = new TimeIndex();
+            
+            if (existingBitmap != null && existingBitmap.length > 0) {
+                TimeIndex pgIndex = TimeIndex.deserialize(existingBitmap);
+                for (int v : pgIndex.toArray()) {
+                    mergedIndex.add(v);
+                }
+            }
+            
+            int partitionSize = getPartitionSize(granularity);
+            for (int v : index.toArray()) {
+                int relativeValue = v % partitionSize;
+                mergedIndex.add(relativeValue);
+            }
+            
+            byte[] serialized = mergedIndex.serialize();
+            pgRepository.savePartitionBitmap(indexName, entityId, granularity, partition, serialized);
+        } catch (Exception e) {
+            org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                    .error("Failed to save partition bitmap: {}", e.getMessage());
+        }
+    }
+
+    private int getPartitionSize(Granularity granularity) {
+        return switch (granularity) {
+            case DAY -> 180;
+            case MONTH -> 6;
+            case YEAR -> 1;
+        };
     }
 
     @Override
@@ -218,8 +257,6 @@ public class IndexServiceImpl implements IndexService {
             byPartition.computeIfAbsent(partition, k -> new java.util.ArrayList<>()).add(value);
         }
 
-        java.util.List<MeterIndex> pgIndexes = new java.util.ArrayList<>();
-        
         for (var entry : byPartition.entrySet()) {
             int partition = entry.getKey();
             List<Integer> partitionValues = entry.getValue();
@@ -230,18 +267,15 @@ public class IndexServiceImpl implements IndexService {
                 TimeIndex index = getOrLoadForWrite(key);
                 for (int value : partitionValues) {
                     index.add(value);
-                    if (persistenceEnabled) {
-                        pgIndexes.add(new MeterIndex(indexName, entityId, granularity, value, partition));
-                    }
                 }
                 markDirty(key, index);
+                
+                if (persistenceEnabled) {
+                    savePartitionBitmapToPostgres(indexName, entityId, granularity, partition, index);
+                }
             } finally {
                 lock.writeLock().unlock();
             }
-        }
-        
-        if (persistenceEnabled && !pgIndexes.isEmpty()) {
-            saveBatchToPostgres(pgIndexes);
         }
     }
     
@@ -434,6 +468,15 @@ public class IndexServiceImpl implements IndexService {
                     return null;
                 }
             }
+            
+            if (persistenceEnabled && pgRepository != null) {
+                index = loadFromPostgres(key);
+                if (index != null) {
+                    putInCache(key, index);
+                    return index;
+                }
+            }
+            
             return null;
         } finally {
             lock.writeLock().unlock();
@@ -445,6 +488,7 @@ public class IndexServiceImpl implements IndexService {
         if (index != null) {
             return index;
         }
+        
         byte[] data = redisTemplate.opsForValue().get(key);
         if (data != null && data.length > 0) {
             try {
@@ -452,11 +496,47 @@ public class IndexServiceImpl implements IndexService {
             } catch (Exception e) {
                 index = new TimeIndex();
             }
+        } else if (persistenceEnabled && pgRepository != null) {
+            index = loadFromPostgres(key);
+            if (index == null) {
+                index = new TimeIndex();
+            }
         } else {
             index = new TimeIndex();
         }
+        
         putInCache(key, index);
         return index;
+    }
+
+    private TimeIndex loadFromPostgres(String key) {
+        try {
+            String[] parts = key.split(":");
+            if (parts.length != 5) {
+                return null;
+            }
+            String indexName = parts[2];
+            Granularity granularity = Granularity.valueOf(parts[3].toUpperCase());
+            long entityId = Long.parseLong(parts[4]);
+            int partition = parsePartition(key, granularity);
+            
+            byte[] bitmapData = pgRepository.getPartitionBitmap(indexName, entityId, granularity, partition);
+            if (bitmapData != null && bitmapData.length > 0) {
+                return TimeIndex.deserialize(bitmapData);
+            }
+        } catch (Exception e) {
+            org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                    .debug("Failed to load from PostgreSQL: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    private int parsePartition(String key, Granularity granularity) {
+        String[] parts = key.split(":");
+        if (parts.length >= 5) {
+            return Integer.parseInt(parts[4]);
+        }
+        return 0;
     }
 
     private void markDirty(String key, TimeIndex index) {
@@ -529,5 +609,13 @@ public class IndexServiceImpl implements IndexService {
         if (closed) {
             throw new IllegalStateException("Index service is closed");
         }
+    }
+
+    public IndexRepository getPgRepository() {
+        return pgRepository;
+    }
+
+    public boolean isPersistenceEnabled() {
+        return persistenceEnabled;
     }
 }

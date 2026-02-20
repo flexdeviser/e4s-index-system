@@ -93,4 +93,42 @@ public interface IndexRepository {
      * @return distinct entity count
      */
     long countDistinctEntities(String indexName);
+
+    // ===== Partitioned Bitmap Methods =====
+
+    /**
+     * Saves or updates a partition bitmap.
+     * Reads existing bitmap, merges with new data, and saves.
+     *
+     * @param indexName the index name
+     * @param entityId the entity ID
+     * @param granularity the granularity
+     * @param partitionNum the partition number
+     * @param bitmapData the serialized RoaringBitmap data
+     */
+    void savePartitionBitmap(String indexName, Long entityId, Granularity granularity, 
+                            int partitionNum, byte[] bitmapData);
+
+    /**
+     * Gets the partition bitmap data.
+     *
+     * @param indexName the index name
+     * @param entityId the entity ID
+     * @param granularity the granularity
+     * @param partitionNum the partition number
+     * @return serialized bitmap data or null if not exists
+     */
+    byte[] getPartitionBitmap(String indexName, Long entityId, Granularity granularity, 
+                             int partitionNum);
+
+    /**
+     * Deletes a partition bitmap.
+     *
+     * @param indexName the index name
+     * @param entityId the entity ID
+     * @param granularity the granularity
+     * @param partitionNum the partition number
+     */
+    void deletePartitionBitmap(String indexName, Long entityId, Granularity granularity, 
+                               int partitionNum);
 }

@@ -4,6 +4,7 @@ import com.e4s.index.model.Granularity;
 import com.e4s.index.model.TimeIndex;
 import com.e4s.index.service.IndexService;
 import com.e4s.index.service.IndexStats;
+import com.e4s.index.util.PartitionUtils;
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -33,7 +34,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <h2>Redis Key Structure</h2>
  * <ul>
  *   <li>{@code e4s:index:registry} - Set of all index names</li>
- *   <li>{@code e4s:index:{name}:{granularity}:{entityId}} - RoaringBitmap data</li>
+ *   <li>{@code e4s:index:{name}:{granularity}:{entityId}:{partition}} - Partitioned RoaringBitmap data</li>
  * </ul>
  * 
  * <h2>Thread Safety</h2>
@@ -48,7 +49,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public class IndexServiceImpl implements IndexService {
 
     private static final String INDEX_SET_KEY = "e4s:index:registry";
-    private static final String KEY_FORMAT = "e4s:index:%s:%s:%d";
 
     private final RedisTemplate<String, byte[]> redisTemplate;
     private final int maxCacheSize;
@@ -137,7 +137,7 @@ public class IndexServiceImpl implements IndexService {
     @Override
     public void mark(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        String key = buildKey(indexName, granularity, entityId, value);
         ReadWriteLock lock = getLock(key);
         lock.writeLock().lock();
         try {
@@ -152,22 +152,38 @@ public class IndexServiceImpl implements IndexService {
     @Override
     public void markBatch(String indexName, Long entityId, Granularity granularity, int[] values) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
-        ReadWriteLock lock = getLock(key);
-        lock.writeLock().lock();
-        try {
-            TimeIndex index = getOrLoadForWrite(key);
-            index.addAll(values);
-            markDirty(key, index);
-        } finally {
-            lock.writeLock().unlock();
+        if (values == null || values.length == 0) {
+            return;
+        }
+
+        java.util.Map<Integer, java.util.List<Integer>> byPartition = new java.util.HashMap<>();
+        for (int value : values) {
+            int partition = PartitionUtils.getPartition(value, granularity);
+            byPartition.computeIfAbsent(partition, k -> new java.util.ArrayList<>()).add(value);
+        }
+
+        for (var entry : byPartition.entrySet()) {
+            int partition = entry.getKey();
+            List<Integer> partitionValues = entry.getValue();
+            String key = PartitionUtils.buildKey(indexName, granularity, entityId, partition);
+            ReadWriteLock lock = getLock(key);
+            lock.writeLock().lock();
+            try {
+                TimeIndex index = getOrLoadForWrite(key);
+                for (int value : partitionValues) {
+                    index.add(value);
+                }
+                markDirty(key, index);
+            } finally {
+                lock.writeLock().unlock();
+            }
         }
     }
 
     @Override
     public boolean exists(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        String key = buildKey(indexName, granularity, entityId, value);
         TimeIndex index = getOrLoad(key);
         return index != null && index.contains(value);
     }
@@ -175,30 +191,83 @@ public class IndexServiceImpl implements IndexService {
     @Override
     public Optional<Integer> findPrev(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        return findPrevInternal(indexName, granularity, entityId, value, false);
+    }
+
+    private Optional<Integer> findPrevInternal(String indexName, Granularity granularity, Long entityId, int value, boolean fromPrevPartition) {
+        String key = buildKey(indexName, granularity, entityId, value);
         TimeIndex index = getOrLoad(key);
-        if (index == null) {
-            return Optional.empty();
+        
+        if (index != null) {
+            Optional<Integer> result = index.findPrev(value);
+            if (result.isPresent()) {
+                return result;
+            }
         }
-        return index.findPrev(value);
+        
+        if (!fromPrevPartition) {
+            String prevKey = PartitionUtils.getPrevPartitionKey(indexName, granularity, entityId, value);
+            if (prevKey != null) {
+                TimeIndex prevIndex = loadFromRedis(prevKey);
+                if (prevIndex != null) {
+                    return prevIndex.findPrev(Integer.MAX_VALUE);
+                }
+            }
+        }
+        
+        return Optional.empty();
     }
 
     @Override
     public Optional<Integer> findNext(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        return findNextInternal(indexName, granularity, entityId, value, false);
+    }
+
+    private Optional<Integer> findNextInternal(String indexName, Granularity granularity, Long entityId, int value, boolean fromNextPartition) {
+        String key = buildKey(indexName, granularity, entityId, value);
         TimeIndex index = getOrLoad(key);
-        if (index == null) {
-            return Optional.empty();
+        
+        if (index != null) {
+            Optional<Integer> result = index.findNext(value);
+            if (result.isPresent()) {
+                return result;
+            }
         }
-        return index.findNext(value);
+        
+        if (!fromNextPartition) {
+            String nextKey = PartitionUtils.getNextPartitionKey(indexName, granularity, entityId, value);
+            TimeIndex nextIndex = loadFromRedis(nextKey);
+            if (nextIndex != null) {
+                return nextIndex.findNext(Integer.MIN_VALUE);
+            }
+        }
+        
+        return Optional.empty();
+    }
+
+    private TimeIndex loadFromRedis(String key) {
+        if (key == null) {
+            return null;
+        }
+        try {
+            byte[] data = redisTemplate.opsForValue().get(key);
+            if (data != null && data.length > 0) {
+                return TimeIndex.deserialize(data);
+            }
+        } catch (Exception e) {
+            // Log and return null
+        }
+        return null;
     }
 
     @Override
     public void evictEntity(String indexName, Long entityId) {
         for (Granularity g : Granularity.values()) {
-            String key = buildKey(indexName, g, entityId);
-            cache.remove(key);
+            for (int partition = 0; partition < 20; partition++) {
+                String key = PartitionUtils.buildKey(indexName, g, entityId, partition);
+                cache.remove(key);
+            }
         }
     }
 
@@ -249,8 +318,8 @@ public class IndexServiceImpl implements IndexService {
         dirtyEntries.clear();
     }
 
-    private String buildKey(String indexName, Granularity granularity, Long entityId) {
-        return String.format(KEY_FORMAT, indexName, granularity.name().toLowerCase(), entityId);
+    private String buildKey(String indexName, Granularity granularity, Long entityId, int value) {
+        return PartitionUtils.buildKeyForValue(indexName, granularity, entityId, value);
     }
 
     private ReadWriteLock getLock(String key) {

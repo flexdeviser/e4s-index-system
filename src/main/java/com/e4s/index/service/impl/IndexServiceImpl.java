@@ -1,9 +1,12 @@
 package com.e4s.index.service.impl;
 
 import com.e4s.index.model.Granularity;
+import com.e4s.index.model.MeterIndex;
 import com.e4s.index.model.TimeIndex;
+import com.e4s.index.repository.IndexRepository;
 import com.e4s.index.service.IndexService;
 import com.e4s.index.service.IndexStats;
+import com.e4s.index.util.PartitionUtils;
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -33,7 +36,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <h2>Redis Key Structure</h2>
  * <ul>
  *   <li>{@code e4s:index:registry} - Set of all index names</li>
- *   <li>{@code e4s:index:{name}:{granularity}:{entityId}} - RoaringBitmap data</li>
+ *   <li>{@code e4s:index:{name}:{granularity}:{entityId}:{partition}} - Partitioned RoaringBitmap data</li>
  * </ul>
  * 
  * <h2>Thread Safety</h2>
@@ -48,7 +51,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public class IndexServiceImpl implements IndexService {
 
     private static final String INDEX_SET_KEY = "e4s:index:registry";
-    private static final String KEY_FORMAT = "e4s:index:%s:%s:%d";
 
     private final RedisTemplate<String, byte[]> redisTemplate;
     private final int maxCacheSize;
@@ -57,26 +59,44 @@ public class IndexServiceImpl implements IndexService {
     private final ConcurrentHashMap<String, Boolean> dirtyEntries;
     private final ScheduledExecutorService flushExecutor;
     private final long flushIntervalMs;
+    private final IndexRepository pgRepository;
+    private final boolean persistenceEnabled;
+    private final boolean asyncPgWrite;
     private volatile boolean closed;
 
     /**
      * Creates a new IndexServiceImpl with write-behind disabled (synchronous writes).
+     * No PostgreSQL persistence.
      *
      * @param redisTemplate the Redis template for data access
      * @param maxCacheSize the maximum number of entries in the LRU cache
      */
     public IndexServiceImpl(RedisTemplate<String, byte[]> redisTemplate, int maxCacheSize) {
-        this(redisTemplate, maxCacheSize, 0);
+        this(redisTemplate, maxCacheSize, 0, null, false);
     }
 
     /**
-     * Creates a new IndexServiceImpl with optional write-behind.
+     * Creates a new IndexServiceImpl with optional write-behind. No PostgreSQL persistence.
      *
      * @param redisTemplate the Redis template for data access
      * @param maxCacheSize the maximum number of entries in the LRU cache
      * @param flushIntervalMs flush interval in milliseconds. If 0, writes are synchronous.
      */
     public IndexServiceImpl(RedisTemplate<String, byte[]> redisTemplate, int maxCacheSize, long flushIntervalMs) {
+        this(redisTemplate, maxCacheSize, flushIntervalMs, null, false);
+    }
+
+    /**
+     * Creates a new IndexServiceImpl with PostgreSQL persistence.
+     *
+     * @param redisTemplate the Redis template for data access
+     * @param maxCacheSize the maximum number of entries in the LRU cache
+     * @param flushIntervalMs flush interval in milliseconds for Redis write-behind
+     * @param pgRepository the PostgreSQL repository (can be null if persistence disabled)
+     * @param asyncPgWrite whether to write to PostgreSQL asynchronously
+     */
+    public IndexServiceImpl(RedisTemplate<String, byte[]> redisTemplate, int maxCacheSize, 
+                           long flushIntervalMs, IndexRepository pgRepository, boolean asyncPgWrite) {
         this.redisTemplate = redisTemplate;
         this.maxCacheSize = maxCacheSize;
         this.cache = new Object2ObjectLinkedOpenHashMap<>(maxCacheSize);
@@ -84,6 +104,9 @@ public class IndexServiceImpl implements IndexService {
         this.indexLocks = new ConcurrentHashMap<>();
         this.dirtyEntries = new ConcurrentHashMap<>();
         this.flushIntervalMs = flushIntervalMs;
+        this.pgRepository = pgRepository;
+        this.persistenceEnabled = pgRepository != null;
+        this.asyncPgWrite = asyncPgWrite;
         this.closed = false;
         
         if (flushIntervalMs > 0) {
@@ -119,6 +142,10 @@ public class IndexServiceImpl implements IndexService {
         }
         redisTemplate.opsForSet().remove(INDEX_SET_KEY, indexName.getBytes());
         evictIndex(indexName);
+        
+        if (persistenceEnabled) {
+            pgRepository.deleteByIndexName(indexName);
+        }
     }
 
     @Override
@@ -137,37 +164,145 @@ public class IndexServiceImpl implements IndexService {
     @Override
     public void mark(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        
+        int partition = PartitionUtils.getPartition(value, granularity);
+        String key = buildKey(indexName, granularity, entityId, value);
         ReadWriteLock lock = getLock(key);
         lock.writeLock().lock();
         try {
             TimeIndex index = getOrLoadForWrite(key);
             index.add(value);
             markDirty(key, index);
+            
+            if (persistenceEnabled) {
+                saveToPostgres(indexName, entityId, granularity, value, partition, index);
+            }
         } finally {
             lock.writeLock().unlock();
         }
+    }
+    
+    private void saveToPostgres(String indexName, Long entityId, Granularity granularity, 
+                                int value, int partition, TimeIndex index) {
+        savePartitionBitmapToPostgres(indexName, entityId, granularity, partition, index);
+    }
+
+    private void savePartitionBitmapToPostgres(String indexName, Long entityId, Granularity granularity, 
+                                               int partition, TimeIndex index) {
+        if (asyncPgWrite) {
+            java.util.concurrent.CompletableFuture.runAsync(() -> {
+                try {
+                    savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
+                } catch (Exception e) {
+                    org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                            .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
+                }
+            });
+        } else {
+            try {
+                savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
+            } catch (Exception e) {
+                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                        .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
+            }
+        }
+    }
+
+    private void savePartitionBitmapToPgSync(String indexName, Long entityId, Granularity granularity, 
+                                               int partition, TimeIndex index) {
+        try {
+            byte[] existingBitmap = pgRepository.getPartitionBitmap(indexName, entityId, granularity, partition);
+            
+            TimeIndex mergedIndex = new TimeIndex();
+            
+            if (existingBitmap != null && existingBitmap.length > 0) {
+                TimeIndex pgIndex = TimeIndex.deserialize(existingBitmap);
+                for (int v : pgIndex.toArray()) {
+                    mergedIndex.add(v);
+                }
+            }
+            
+            int partitionSize = getPartitionSize(granularity);
+            for (int v : index.toArray()) {
+                int relativeValue = v % partitionSize;
+                mergedIndex.add(relativeValue);
+            }
+            
+            byte[] serialized = mergedIndex.serialize();
+            pgRepository.savePartitionBitmap(indexName, entityId, granularity, partition, serialized);
+        } catch (Exception e) {
+            org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                    .error("Failed to save partition bitmap: {}", e.getMessage());
+        }
+    }
+
+    private int getPartitionSize(Granularity granularity) {
+        return switch (granularity) {
+            case DAY -> 180;
+            case MONTH -> 6;
+            case YEAR -> 1;
+        };
     }
 
     @Override
     public void markBatch(String indexName, Long entityId, Granularity granularity, int[] values) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
-        ReadWriteLock lock = getLock(key);
-        lock.writeLock().lock();
-        try {
-            TimeIndex index = getOrLoadForWrite(key);
-            index.addAll(values);
-            markDirty(key, index);
-        } finally {
-            lock.writeLock().unlock();
+        if (values == null || values.length == 0) {
+            return;
+        }
+
+        java.util.Map<Integer, java.util.List<Integer>> byPartition = new java.util.HashMap<>();
+        for (int value : values) {
+            int partition = PartitionUtils.getPartition(value, granularity);
+            byPartition.computeIfAbsent(partition, k -> new java.util.ArrayList<>()).add(value);
+        }
+
+        for (var entry : byPartition.entrySet()) {
+            int partition = entry.getKey();
+            List<Integer> partitionValues = entry.getValue();
+            String key = PartitionUtils.buildKey(indexName, granularity, entityId, partition);
+            ReadWriteLock lock = getLock(key);
+            lock.writeLock().lock();
+            try {
+                TimeIndex index = getOrLoadForWrite(key);
+                for (int value : partitionValues) {
+                    index.add(value);
+                }
+                markDirty(key, index);
+                
+                if (persistenceEnabled) {
+                    savePartitionBitmapToPostgres(indexName, entityId, granularity, partition, index);
+                }
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+    }
+    
+    private void saveBatchToPostgres(java.util.List<MeterIndex> indexes) {
+        if (asyncPgWrite) {
+            java.util.concurrent.CompletableFuture.runAsync(() -> {
+                try {
+                    pgRepository.saveBatch(indexes);
+                } catch (Exception e) {
+                    org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                            .error("Failed to batch save to PostgreSQL: {}", e.getMessage());
+                }
+            });
+        } else {
+            try {
+                pgRepository.saveBatch(indexes);
+            } catch (Exception e) {
+                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                        .error("Failed to batch save to PostgreSQL: {}", e.getMessage());
+            }
         }
     }
 
     @Override
     public boolean exists(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        String key = buildKey(indexName, granularity, entityId, value);
         TimeIndex index = getOrLoad(key);
         return index != null && index.contains(value);
     }
@@ -175,30 +310,83 @@ public class IndexServiceImpl implements IndexService {
     @Override
     public Optional<Integer> findPrev(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        return findPrevInternal(indexName, granularity, entityId, value, false);
+    }
+
+    private Optional<Integer> findPrevInternal(String indexName, Granularity granularity, Long entityId, int value, boolean fromPrevPartition) {
+        String key = buildKey(indexName, granularity, entityId, value);
         TimeIndex index = getOrLoad(key);
-        if (index == null) {
-            return Optional.empty();
+        
+        if (index != null) {
+            Optional<Integer> result = index.findPrev(value);
+            if (result.isPresent()) {
+                return result;
+            }
         }
-        return index.findPrev(value);
+        
+        if (!fromPrevPartition) {
+            String prevKey = PartitionUtils.getPrevPartitionKey(indexName, granularity, entityId, value);
+            if (prevKey != null) {
+                TimeIndex prevIndex = loadFromRedis(prevKey);
+                if (prevIndex != null) {
+                    return prevIndex.findPrev(Integer.MAX_VALUE);
+                }
+            }
+        }
+        
+        return Optional.empty();
     }
 
     @Override
     public Optional<Integer> findNext(String indexName, Long entityId, Granularity granularity, int value) {
         checkClosed();
-        String key = buildKey(indexName, granularity, entityId);
+        return findNextInternal(indexName, granularity, entityId, value, false);
+    }
+
+    private Optional<Integer> findNextInternal(String indexName, Granularity granularity, Long entityId, int value, boolean fromNextPartition) {
+        String key = buildKey(indexName, granularity, entityId, value);
         TimeIndex index = getOrLoad(key);
-        if (index == null) {
-            return Optional.empty();
+        
+        if (index != null) {
+            Optional<Integer> result = index.findNext(value);
+            if (result.isPresent()) {
+                return result;
+            }
         }
-        return index.findNext(value);
+        
+        if (!fromNextPartition) {
+            String nextKey = PartitionUtils.getNextPartitionKey(indexName, granularity, entityId, value);
+            TimeIndex nextIndex = loadFromRedis(nextKey);
+            if (nextIndex != null) {
+                return nextIndex.findNext(Integer.MIN_VALUE);
+            }
+        }
+        
+        return Optional.empty();
+    }
+
+    private TimeIndex loadFromRedis(String key) {
+        if (key == null) {
+            return null;
+        }
+        try {
+            byte[] data = redisTemplate.opsForValue().get(key);
+            if (data != null && data.length > 0) {
+                return TimeIndex.deserialize(data);
+            }
+        } catch (Exception e) {
+            // Log and return null
+        }
+        return null;
     }
 
     @Override
     public void evictEntity(String indexName, Long entityId) {
         for (Granularity g : Granularity.values()) {
-            String key = buildKey(indexName, g, entityId);
-            cache.remove(key);
+            for (int partition = 0; partition < 20; partition++) {
+                String key = PartitionUtils.buildKey(indexName, g, entityId, partition);
+                cache.remove(key);
+            }
         }
     }
 
@@ -249,8 +437,8 @@ public class IndexServiceImpl implements IndexService {
         dirtyEntries.clear();
     }
 
-    private String buildKey(String indexName, Granularity granularity, Long entityId) {
-        return String.format(KEY_FORMAT, indexName, granularity.name().toLowerCase(), entityId);
+    private String buildKey(String indexName, Granularity granularity, Long entityId, int value) {
+        return PartitionUtils.buildKeyForValue(indexName, granularity, entityId, value);
     }
 
     private ReadWriteLock getLock(String key) {
@@ -280,6 +468,15 @@ public class IndexServiceImpl implements IndexService {
                     return null;
                 }
             }
+            
+            if (persistenceEnabled && pgRepository != null) {
+                index = loadFromPostgres(key);
+                if (index != null) {
+                    putInCache(key, index);
+                    return index;
+                }
+            }
+            
             return null;
         } finally {
             lock.writeLock().unlock();
@@ -291,6 +488,7 @@ public class IndexServiceImpl implements IndexService {
         if (index != null) {
             return index;
         }
+        
         byte[] data = redisTemplate.opsForValue().get(key);
         if (data != null && data.length > 0) {
             try {
@@ -298,11 +496,47 @@ public class IndexServiceImpl implements IndexService {
             } catch (Exception e) {
                 index = new TimeIndex();
             }
+        } else if (persistenceEnabled && pgRepository != null) {
+            index = loadFromPostgres(key);
+            if (index == null) {
+                index = new TimeIndex();
+            }
         } else {
             index = new TimeIndex();
         }
+        
         putInCache(key, index);
         return index;
+    }
+
+    private TimeIndex loadFromPostgres(String key) {
+        try {
+            String[] parts = key.split(":");
+            if (parts.length != 5) {
+                return null;
+            }
+            String indexName = parts[2];
+            Granularity granularity = Granularity.valueOf(parts[3].toUpperCase());
+            long entityId = Long.parseLong(parts[4]);
+            int partition = parsePartition(key, granularity);
+            
+            byte[] bitmapData = pgRepository.getPartitionBitmap(indexName, entityId, granularity, partition);
+            if (bitmapData != null && bitmapData.length > 0) {
+                return TimeIndex.deserialize(bitmapData);
+            }
+        } catch (Exception e) {
+            org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                    .debug("Failed to load from PostgreSQL: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    private int parsePartition(String key, Granularity granularity) {
+        String[] parts = key.split(":");
+        if (parts.length >= 5) {
+            return Integer.parseInt(parts[4]);
+        }
+        return 0;
     }
 
     private void markDirty(String key, TimeIndex index) {
@@ -375,5 +609,13 @@ public class IndexServiceImpl implements IndexService {
         if (closed) {
             throw new IllegalStateException("Index service is closed");
         }
+    }
+
+    public IndexRepository getPgRepository() {
+        return pgRepository;
+    }
+
+    public boolean isPersistenceEnabled() {
+        return persistenceEnabled;
     }
 }

@@ -185,4 +185,22 @@ public class TimeIndex {
     public int cardinality() {
         return bitmap.getCardinality();
     }
+
+    /**
+     * Returns all values in this index as an int array.
+     *
+     * @return array of all values
+     */
+    public int[] toArray() {
+        return bitmap.toArray();
+    }
+
+    /**
+     * Gets the underlying RoaringBitmap.
+     *
+     * @return the bitmap
+     */
+    public RoaringBitmap getBitmap() {
+        return bitmap;
+    }
 }

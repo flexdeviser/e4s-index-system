@@ -212,6 +212,64 @@ IndexService service = new IndexServiceImpl(redisTemplate, 100000, 100);
 
 ---
 
+## Partitioned Index
+
+For memory efficiency, indexes are partitioned by time intervals instead of holding a single bitmap per entity.
+
+### Partition Size
+
+| Granularity | Partition Interval | Bits per Partition |
+|-------------|-------------------|-------------------|
+| DAY | 180 days | ~180 bits |
+| MONTH | 6 months | ~6 bits |
+| YEAR | 1 year | 1 bit |
+
+### Key Structure
+
+```
+e4s:index:{name}:{granularity}:{entityId}:{partition}
+Example: e4s:index:meter-data:day:12345:109
+```
+
+Where partition = epochValue / 180 (for DAY)
+
+### Memory Comparison
+
+| Scenario | Non-Partitioned | Partitioned (180-day) |
+|----------|-----------------|----------------------|
+| Per meter (DAY) | 744 bytes | ~50 bytes |
+| Cache 1M meters | 744 MB | ~50 MB |
+| Memory reduction | - | **~15x** |
+
+### Cross-Partition Queries
+
+For `findPrev` and `findNext` queries near partition boundaries, the service may need to check adjacent partitions.
+
+**Example: `findPrev(June 15, 2025)`**
+
+```
+Partition 111: Jan 1 - May 29, 2025 (days 19723-20159)
+Partition 112: May 30 - Nov 25, 2025 (days 20160-20639)
+```
+
+1. Check partition 112 for value < day 20178
+2. If not found, load partition 111 from Redis and find max value
+
+**Performance Impact:**
+
+| Scenario | Redis Calls | Notes |
+|----------|-------------|-------|
+| Value in same partition | 0-1 | Cache hit or single load |
+| Value in adjacent partition | 1-2 | Extra Redis call |
+
+This is why `findPrev`/`findNext` are slower (~550K ops/sec) compared to `exists` (~1.9M ops/sec) in benchmarks.
+
+### Migration
+
+Partitioned index is the new default format. There is no automatic migration from non-partitioned keys - fresh deployment recommended.
+
+---
+
 ## Memory Estimation
 
 ### Per Entity

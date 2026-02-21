@@ -9,6 +9,8 @@ import com.e4s.index.service.IndexStats;
 import com.e4s.index.util.PartitionUtils;
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 
 import java.util.ArrayList;
@@ -54,6 +56,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class IndexServiceImpl implements IndexService {
 
+    private static final Logger log = LoggerFactory.getLogger(IndexServiceImpl.class);
     private static final String INDEX_SET_KEY = "e4s:index:registry";
 
     private final RedisTemplate<String, byte[]> redisTemplate;
@@ -135,7 +138,7 @@ public class IndexServiceImpl implements IndexService {
                         return t;
                     },
                     (r, executor) -> {
-                        org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                        log
                                 .warn("PostgreSQL async write queue full, rejecting task");
                     }
             );
@@ -228,17 +231,17 @@ public class IndexServiceImpl implements IndexService {
                     try {
                         savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
                     } catch (Exception e) {
-                        org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                        log
                                 .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
                     }
                 }, pgAsyncExecutor);
             } catch (java.util.concurrent.RejectedExecutionException e) {
-                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                log
                         .warn("PostgreSQL async queue rejected, falling back to sync: {}", e.getMessage());
                 try {
                     savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
                 } catch (Exception ex) {
-                    org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                    log
                             .error("Failed to save partition bitmap to PostgreSQL: {}", ex.getMessage());
                 }
             }
@@ -246,7 +249,7 @@ public class IndexServiceImpl implements IndexService {
             try {
                 savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
             } catch (Exception e) {
-                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                log
                         .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
             }
         }
@@ -275,7 +278,7 @@ public class IndexServiceImpl implements IndexService {
             byte[] serialized = mergedIndex.serialize();
             pgRepository.savePartitionBitmap(indexName, entityId, granularity, partition, serialized);
         } catch (Exception e) {
-            org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+            log
                     .error("Failed to save partition bitmap: {}", e.getMessage());
         }
     }
@@ -330,17 +333,17 @@ public class IndexServiceImpl implements IndexService {
                     try {
                         pgRepository.saveBatch(indexes);
                     } catch (Exception e) {
-                        org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                        log
                                 .error("Failed to batch save to PostgreSQL: {}", e.getMessage());
                     }
                 }, pgAsyncExecutor);
             } catch (java.util.concurrent.RejectedExecutionException e) {
-                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                log
                         .warn("PostgreSQL async queue rejected batch, falling back to sync");
                 try {
                     pgRepository.saveBatch(indexes);
                 } catch (Exception ex) {
-                    org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                    log
                             .error("Failed to batch save to PostgreSQL: {}", ex.getMessage());
                 }
             }
@@ -348,7 +351,7 @@ public class IndexServiceImpl implements IndexService {
             try {
                 pgRepository.saveBatch(indexes);
             } catch (Exception e) {
-                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                log
                         .error("Failed to batch save to PostgreSQL: {}", e.getMessage());
             }
         }
@@ -592,7 +595,7 @@ public class IndexServiceImpl implements IndexService {
                 return TimeIndex.deserialize(bitmapData);
             }
         } catch (Exception e) {
-            org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+            log
                     .debug("Failed to load from PostgreSQL: {}", e.getMessage());
         }
         return null;

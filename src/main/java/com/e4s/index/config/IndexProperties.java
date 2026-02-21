@@ -98,6 +98,9 @@ public class IndexProperties {
         private int batchSize = 1000;
         private boolean asyncWrite = true;
         private long flushIntervalMs = 100;
+        private int asyncQueueSize = 10000;
+        private int asyncCoreThreads = 4;
+        private int asyncMaxThreads = 8;
 
         /**
          * Gets whether persistence is enabled.
@@ -187,6 +190,30 @@ public class IndexProperties {
          */
         public void setFlushIntervalMs(long flushIntervalMs) {
             this.flushIntervalMs = flushIntervalMs;
+        }
+
+        public int getAsyncQueueSize() {
+            return asyncQueueSize;
+        }
+
+        public void setAsyncQueueSize(int asyncQueueSize) {
+            this.asyncQueueSize = asyncQueueSize;
+        }
+
+        public int getAsyncCoreThreads() {
+            return asyncCoreThreads;
+        }
+
+        public void setAsyncCoreThreads(int asyncCoreThreads) {
+            this.asyncCoreThreads = asyncCoreThreads;
+        }
+
+        public int getAsyncMaxThreads() {
+            return asyncMaxThreads;
+        }
+
+        public void setAsyncMaxThreads(int asyncMaxThreads) {
+            this.asyncMaxThreads = asyncMaxThreads;
         }
     }
 }

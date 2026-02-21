@@ -16,8 +16,12 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -62,6 +66,7 @@ public class IndexServiceImpl implements IndexService {
     private final IndexRepository pgRepository;
     private final boolean persistenceEnabled;
     private final boolean asyncPgWrite;
+    private final ExecutorService pgAsyncExecutor;
     private volatile boolean closed;
 
     /**
@@ -118,6 +123,24 @@ public class IndexServiceImpl implements IndexService {
             this.flushExecutor.scheduleAtFixedRate(this::flush, flushIntervalMs, flushIntervalMs, TimeUnit.MILLISECONDS);
         } else {
             this.flushExecutor = null;
+        }
+
+        if (asyncPgWrite && pgRepository != null) {
+            this.pgAsyncExecutor = new ThreadPoolExecutor(
+                    4, 8, 60L, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<>(10000),
+                    r -> {
+                        Thread t = new Thread(r, "pg-async-writer");
+                        t.setDaemon(true);
+                        return t;
+                    },
+                    (r, executor) -> {
+                        org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                                .warn("PostgreSQL async write queue full, rejecting task");
+                    }
+            );
+        } else {
+            this.pgAsyncExecutor = null;
         }
     }
 
@@ -200,14 +223,25 @@ public class IndexServiceImpl implements IndexService {
     private void savePartitionBitmapToPostgres(String indexName, Long entityId, Granularity granularity, 
                                                int partition, TimeIndex index) {
         if (asyncPgWrite) {
-            java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try {
+                java.util.concurrent.CompletableFuture.runAsync(() -> {
+                    try {
+                        savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
+                    } catch (Exception e) {
+                        org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                                .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
+                    }
+                }, pgAsyncExecutor);
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                        .warn("PostgreSQL async queue rejected, falling back to sync: {}", e.getMessage());
                 try {
                     savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
-                } catch (Exception e) {
+                } catch (Exception ex) {
                     org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
-                            .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
+                            .error("Failed to save partition bitmap to PostgreSQL: {}", ex.getMessage());
                 }
-            });
+            }
         } else {
             try {
                 savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
@@ -291,14 +325,25 @@ public class IndexServiceImpl implements IndexService {
     
     private void saveBatchToPostgres(java.util.List<MeterIndex> indexes) {
         if (asyncPgWrite) {
-            java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try {
+                java.util.concurrent.CompletableFuture.runAsync(() -> {
+                    try {
+                        pgRepository.saveBatch(indexes);
+                    } catch (Exception e) {
+                        org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                                .error("Failed to batch save to PostgreSQL: {}", e.getMessage());
+                    }
+                }, pgAsyncExecutor);
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
+                        .warn("PostgreSQL async queue rejected batch, falling back to sync");
                 try {
                     pgRepository.saveBatch(indexes);
-                } catch (Exception e) {
+                } catch (Exception ex) {
                     org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
-                            .error("Failed to batch save to PostgreSQL: {}", e.getMessage());
+                            .error("Failed to batch save to PostgreSQL: {}", ex.getMessage());
                 }
-            });
+            }
         } else {
             try {
                 pgRepository.saveBatch(indexes);
@@ -439,6 +484,17 @@ public class IndexServiceImpl implements IndexService {
                 }
             } catch (InterruptedException e) {
                 flushExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (pgAsyncExecutor != null) {
+            pgAsyncExecutor.shutdown();
+            try {
+                if (!pgAsyncExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    pgAsyncExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                pgAsyncExecutor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
         }

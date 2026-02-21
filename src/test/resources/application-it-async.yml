@@ -23,7 +23,7 @@ index:
     schema: e4s_index
     batch-size: 100
     async-write: true
-    flush-interval-ms: 100
+    flush-interval-ms: 0
 
 logging:
   level:

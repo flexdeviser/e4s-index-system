@@ -57,7 +57,6 @@ public class IndexServiceImpl implements IndexService {
     private final Object2ObjectMap<String, TimeIndex> cache;
     private final ConcurrentHashMap<String, ReadWriteLock> indexLocks;
     private final ConcurrentHashMap<String, Boolean> dirtyEntries;
-    private final ConcurrentHashMap<String, TimeIndex> pendingPgWrites;
     private final ScheduledExecutorService flushExecutor;
     private final long flushIntervalMs;
     private final IndexRepository pgRepository;
@@ -104,7 +103,6 @@ public class IndexServiceImpl implements IndexService {
         this.cache.defaultReturnValue(null);
         this.indexLocks = new ConcurrentHashMap<>();
         this.dirtyEntries = new ConcurrentHashMap<>();
-        this.pendingPgWrites = new ConcurrentHashMap<>();
         this.flushIntervalMs = flushIntervalMs;
         this.pgRepository = pgRepository;
         this.persistenceEnabled = pgRepository != null;
@@ -201,9 +199,7 @@ public class IndexServiceImpl implements IndexService {
 
     private void savePartitionBitmapToPostgres(String indexName, Long entityId, Granularity granularity, 
                                                int partition, TimeIndex index) {
-        if (asyncPgWrite && flushIntervalMs > 0) {
-            addToPgWriteBuffer(indexName, entityId, granularity, partition, index);
-        } else if (asyncPgWrite) {
+        if (asyncPgWrite) {
             java.util.concurrent.CompletableFuture.runAsync(() -> {
                 try {
                     savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
@@ -220,25 +216,6 @@ public class IndexServiceImpl implements IndexService {
                         .error("Failed to save partition bitmap to PostgreSQL: {}", e.getMessage());
             }
         }
-    }
-
-    private void addToPgWriteBuffer(String indexName, Long entityId, Granularity granularity, 
-                                     int partition, TimeIndex index) {
-        String pgKey = buildPgKey(indexName, entityId, granularity, partition);
-        
-        pendingPgWrites.compute(pgKey, (key, existingIndex) -> {
-            if (existingIndex == null) {
-                return index;
-            }
-            for (int v : index.toArray()) {
-                existingIndex.add(v);
-            }
-            return existingIndex;
-        });
-    }
-
-    private String buildPgKey(String indexName, Long entityId, Granularity granularity, int partition) {
-        return indexName + ":" + entityId + ":" + granularity.name() + ":" + partition;
     }
 
     private void savePartitionBitmapToPgSync(String indexName, Long entityId, Granularity granularity, 
@@ -586,7 +563,7 @@ public class IndexServiceImpl implements IndexService {
      * or can be called manually to force an immediate flush.
      */
     public void flush() {
-        if (dirtyEntries.isEmpty() && pendingPgWrites.isEmpty()) {
+        if (dirtyEntries.isEmpty()) {
             return;
         }
         
@@ -597,35 +574,6 @@ public class IndexServiceImpl implements IndexService {
             }
         }
         dirtyEntries.clear();
-        
-        flushPendingPgWrites();
-    }
-
-    private void flushPendingPgWrites() {
-        if (pendingPgWrites.isEmpty()) {
-            return;
-        }
-        
-        for (var entry : pendingPgWrites.entrySet()) {
-            String pgKey = entry.getKey();
-            TimeIndex index = entry.getValue();
-            
-            String[] parts = pgKey.split(":");
-            if (parts.length != 4) continue;
-            
-            String indexName = parts[0];
-            Long entityId = Long.parseLong(parts[1]);
-            Granularity granularity = Granularity.valueOf(parts[2]);
-            int partition = Integer.parseInt(parts[3]);
-            
-            try {
-                savePartitionBitmapToPgSync(indexName, entityId, granularity, partition, index);
-            } catch (Exception e) {
-                org.slf4j.LoggerFactory.getLogger(IndexServiceImpl.class)
-                        .error("Failed to flush partition bitmap to PostgreSQL: {}", e.getMessage());
-            }
-        }
-        pendingPgWrites.clear();
     }
 
     /**
